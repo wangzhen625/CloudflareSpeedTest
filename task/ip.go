@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/XIU2/CloudflareSpeedTest/utils"
 )
 
 const defaultInputFile = "ip.txt"
@@ -99,6 +101,10 @@ func (r *IPRanges) getIPRange() (minIP, hosts byte) {
 	return
 }
 
+// 非 -allip 模式下，每个 /24 子网随机抽样的 IP 数量。
+// 提高这个值能更精确地代表该 /24 段的延迟/速度，但会成倍增加测速时长。
+const sampleCountPerSubnet = 3
+
 func (r *IPRanges) chooseIPv4() {
 	if r.mask == "/32" { // 单个 IP 则无需随机，直接加入自身即可
 		r.appendIP(r.firstIP)
@@ -109,8 +115,20 @@ func (r *IPRanges) chooseIPv4() {
 				for i := 0; i <= int(hosts); i++ { // 遍历 IP 最后一段最小值到最大值
 					r.appendIPv4(byte(i) + minIP)
 				}
-			} else { // 随机 IP 的最后一段 0.0.0.X
-				r.appendIPv4(minIP + randIPEndWith(hosts))
+			} else { // 当前 /24 随机抽 N 个互不相同的尾段 IP
+				n := sampleCountPerSubnet
+				if n > int(hosts) { // 子网过小（如 /30）时降级为该段全部可选值
+					n = int(hosts)
+				}
+				seen := make(map[byte]bool, n)
+				for len(seen) < n {
+					v := randIPEndWith(hosts)
+					if seen[v] {
+						continue
+					}
+					seen[v] = true
+					r.appendIPv4(minIP + v)
+				}
 			}
 			r.firstIP[14]++ // 0.0.(X+1).X
 			if r.firstIP[14] == 0 {
@@ -147,7 +165,45 @@ func (r *IPRanges) chooseIPv6() {
 	}
 }
 
+// loadHistoricalIPs 从已有的输出文件中读取上次测速保留的 IP，
+// 用于跨次运行保留优质 IP——即便随机抽样这次没抽中，也能再测一次。
+// 文件不存在 / 不可读 / 解析为空时静默返回 nil，调用方继续走原有抽样逻辑。
+func loadHistoricalIPs() []*net.IPAddr {
+	path := utils.Output
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var ips []*net.IPAddr
+	scanner := bufio.NewScanner(f)
+	headerSkipped := false
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if !headerSkipped {
+			headerSkipped = true
+			continue
+		}
+		ipStr := line
+		if i := strings.IndexByte(line, ','); i > 0 {
+			ipStr = line[:i]
+		}
+		if ip := net.ParseIP(ipStr); ip != nil {
+			ips = append(ips, &net.IPAddr{IP: ip})
+		}
+	}
+	return ips
+}
+
 func loadIPRanges() []*net.IPAddr {
+	historical := loadHistoricalIPs()
+
 	ranges := newIPRanges()
 	if IPText != "" { // 从参数中获取 IP 段数据
 		IPs := strings.Split(IPText, ",") // 以逗号分隔为数组并循环遍历
@@ -186,5 +242,38 @@ func loadIPRanges() []*net.IPAddr {
 			}
 		}
 	}
-	return ranges.ips
+
+	// 把上次保留的优质 IP 与本次抽样合并并去重（历史 IP 排在前面）
+	if len(historical) == 0 {
+		return ranges.ips
+	}
+	seen := make(map[string]struct{}, len(historical)+len(ranges.ips))
+	merged := make([]*net.IPAddr, 0, len(historical)+len(ranges.ips))
+	for _, ip := range historical {
+		key := ip.IP.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, ip)
+	}
+	for _, ip := range ranges.ips {
+		key := ip.IP.String()
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		merged = append(merged, ip)
+	}
+	utils.Yellow.Printf("[信息] 从 %s 复用上次保留的 %d 个 IP，合并后共 %d 个待测。\n",
+		path(utils.Output), len(historical), len(merged))
+	return merged
+}
+
+// path 仅用于在日志里展示输出文件路径。
+func path(s string) string {
+	if s == "" {
+		return "result.csv"
+	}
+	return s
 }

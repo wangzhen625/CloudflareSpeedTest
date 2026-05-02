@@ -15,6 +15,8 @@ import (
 
 var (
 	version, versionNew string
+	pagesProject        string
+	interval            int // 定时循环间隔（分钟），0 表示只跑一次
 )
 
 func init() {
@@ -25,12 +27,12 @@ CloudflareSpeedTest ` + version + `
 https://github.com/XIU2/CloudflareSpeedTest
 
 参数：
-    -n 200
-        延迟测速线程；越多延迟测速越快，性能弱的设备 (如路由器) 请勿太高；(默认 200 最多 1000)
+    -n 300
+        延迟测速线程；越多延迟测速越快，性能弱的设备 (如路由器) 请勿太高；(默认 300 最多 1000)
     -t 4
         延迟测速次数；单个 IP 延迟测速的次数；(默认 4 次)
-    -dn 10
-        下载测速数量；延迟测速并排序后，从最低延迟起下载测速的数量；(默认 10 个)
+    -dn 200
+        下载测速数量；延迟测速并排序后，从最低延迟起下载测速的数量；(默认 200 个)
     -dt 10
         下载测速时间；单个 IP 下载测速最长时间，不能太短；(默认 10 秒)
     -tp 443
@@ -45,17 +47,17 @@ https://github.com/XIU2/CloudflareSpeedTest
     -cfcolo HKG,KHH,NRT,LAX,SEA,SJC,FRA,MAD
         匹配指定地区；IATA 机场地区码或国家/城市码，英文逗号分隔，仅 HTTPing 模式可用；(默认 所有地区)
 
-    -tl 200
-        平均延迟上限；只输出低于指定平均延迟的 IP，各上下限条件可搭配使用；(默认 9999 ms)
-    -tll 40
-        平均延迟下限；只输出高于指定平均延迟的 IP；(默认 0 ms)
+    -tl 1000
+        平均延迟上限；只输出低于指定平均延迟的 IP，各上下限条件可搭配使用；(默认 1000 ms)
+    -tll 20
+        平均延迟下限；只输出高于指定平均延迟的 IP；(默认 20 ms)
     -tlr 0.2
         丢包几率上限；只输出低于/等于指定丢包率的 IP，范围 0.00~1.00，0 过滤掉任何丢包的 IP；(默认 1.00)
-    -sl 5
-        下载速度下限；只输出高于指定下载速度的 IP，凑够指定数量 [-dn] 才会停止测速；(默认 0.00 MB/s)
+    -sl 0.2
+        下载速度下限；只输出高于指定下载速度的 IP，凑够指定数量 [-dn] 才会停止测速；(默认 0.20 MB/s)
 
-    -p 10
-        显示结果数量；测速后直接显示指定数量的结果，为 0 时不显示结果直接退出；(默认 10 个)
+    -p 50
+        显示结果数量；测速后直接显示指定数量的结果，为 0 时不显示结果直接退出；(默认 50 个)
     -f ip.txt
         IP段数据文件；如路径含有空格请加上引号；支持其他 CDN IP段；(默认 ip.txt)
     -ip 1.1.1.1,2.2.2.2/24,2606:4700::/32
@@ -66,10 +68,19 @@ https://github.com/XIU2/CloudflareSpeedTest
     -dd
         禁用下载测速；禁用后测速结果会按延迟排序 (默认按下载速度排序)；(默认 启用)
     -allip
-        测速全部的IP；对 IP 段中的每个 IP (仅支持 IPv4) 进行测速；(默认 每个 /24 段随机测速一个 IP)
+        测速全部的IP；对 IP 段中的每个 IP (仅支持 IPv4) 进行测速；(默认 每个 /24 段随机测速 3 个 IP)
 
     -debug
         调试输出模式；会在一些非预期情况下输出更多日志以便判断原因；(默认 关闭)
+
+    -pages 
+        Cloudflare Pages 项目名；测速完成后自动用 wrangler 部署 result.csv + 内置 index.html
+        到 https://<项目名>.pages.dev；首次使用前需 npm i -g wrangler && wrangler login；
+        留空则不上传；(默认 “” 不上传)
+
+    -interval 60
+        定时循环间隔（分钟）；按指定间隔重复执行「测速 + 写 csv + 上传」，
+        按 Ctrl+C 退出；0 表示只跑一次；(默认 0)
 
     -v
         打印程序版本 + 检查版本更新
@@ -78,9 +89,9 @@ https://github.com/XIU2/CloudflareSpeedTest
 `
 	var minDelay, maxDelay, downloadTime int
 	var maxLossRate float64
-	flag.IntVar(&task.Routines, "n", 200, "延迟测速线程")
+	flag.IntVar(&task.Routines, "n", 300, "延迟测速线程")
 	flag.IntVar(&task.PingTimes, "t", 4, "延迟测速次数")
-	flag.IntVar(&task.TestCount, "dn", 10, "下载测速数量")
+	flag.IntVar(&task.TestCount, "dn", 200, "下载测速数量")
 	flag.IntVar(&downloadTime, "dt", 10, "下载测速时间")
 	flag.IntVar(&task.TCPPort, "tp", 443, "指定测速端口")
 	flag.StringVar(&task.URL, "url", "https://cf.xiu2.xyz/url", "指定测速地址")
@@ -89,12 +100,12 @@ https://github.com/XIU2/CloudflareSpeedTest
 	flag.IntVar(&task.HttpingStatusCode, "httping-code", 0, "有效状态代码")
 	flag.StringVar(&task.HttpingCFColo, "cfcolo", "", "匹配指定地区")
 
-	flag.IntVar(&maxDelay, "tl", 9999, "平均延迟上限")
-	flag.IntVar(&minDelay, "tll", 0, "平均延迟下限")
+	flag.IntVar(&maxDelay, "tl", 1000, "平均延迟上限")
+	flag.IntVar(&minDelay, "tll", 20, "平均延迟下限")
 	flag.Float64Var(&maxLossRate, "tlr", 1, "丢包几率上限")
-	flag.Float64Var(&task.MinSpeed, "sl", 0, "下载速度下限")
+	flag.Float64Var(&task.MinSpeed, "sl", 0.2, "下载速度下限")
 
-	flag.IntVar(&utils.PrintNum, "p", 10, "显示结果数量")
+	flag.IntVar(&utils.PrintNum, "p", 50, "显示结果数量")
 	flag.StringVar(&task.IPFile, "f", "ip.txt", "IP段数据文件")
 	flag.StringVar(&task.IPText, "ip", "", "指定IP段数据")
 	flag.StringVar(&utils.Output, "o", "result.csv", "输出结果文件")
@@ -103,6 +114,9 @@ https://github.com/XIU2/CloudflareSpeedTest
 	flag.BoolVar(&task.TestAll, "allip", false, "测速全部 IP")
 
 	flag.BoolVar(&utils.Debug, "debug", false, "调试输出模式")
+
+	flag.StringVar(&pagesProject, "pages", "", "Cloudflare Pages 项目名（留空不上传）")
+	flag.IntVar(&interval, "interval", 0, "定时循环间隔（分钟，0 表示只跑一次）")
 
 	flag.BoolVar(&printVersion, "v", false, "打印程序版本")
 	flag.Usage = func() { fmt.Print(help) }
@@ -114,6 +128,7 @@ https://github.com/XIU2/CloudflareSpeedTest
 	utils.InputMaxDelay = time.Duration(maxDelay) * time.Millisecond
 	utils.InputMinDelay = time.Duration(minDelay) * time.Millisecond
 	utils.InputMaxLossRate = float32(maxLossRate)
+	utils.TCPPort = task.TCPPort
 	task.Timeout = time.Duration(downloadTime) * time.Second
 	task.HttpingCFColomap = task.MapColoMap()
 
@@ -135,13 +150,62 @@ func main() {
 
 	fmt.Printf("# XIU2/CloudflareSpeedTest %s \n\n", version)
 
-	// 开始延迟测速 + 过滤延迟/丢包
+	// 快照可能在 TestDownloadSpeed 内部被改写的全局值，循环每轮重置
+	originalTestCount := task.TestCount
+
+	for round := 1; ; round++ {
+		if interval > 0 && round > 1 {
+			utils.Cyan.Printf("\n========== 第 %d 轮 ==========\n", round)
+		}
+		task.TestCount = originalTestCount
+		runSpeedTest()
+		if interval <= 0 {
+			break
+		}
+		sleepDur := time.Duration(interval) * time.Minute
+		next := time.Now().Add(sleepDur)
+		utils.Cyan.Printf("\n[定时] 下次运行：%s（间隔 %d 分钟），按 Ctrl+C 退出\n",
+			next.Format("2006-01-02 15:04:05"), interval)
+		time.Sleep(sleepDur)
+	}
+
+	if interval <= 0 {
+		endPrint() // 根据情况选择退出方式（针对 Windows）
+	}
+}
+
+// 单轮测速：延迟 → 下载 → 写文件 → 上传 Pages
+func runSpeedTest() {
 	pingData := task.NewPing().Run().FilterDelay().FilterLossRate()
-	// 开始下载测速
 	speedData := task.TestDownloadSpeed(pingData)
-	utils.ExportCsv(speedData) // 输出文件
-	speedData.Print()          // 打印结果
-	endPrint()                 // 根据情况选择退出方式（针对 Windows）
+	utils.ExportCsv(speedData)
+	speedData.Print()
+	if !shouldUpload(speedData) {
+		utils.Yellow.Println("[Pages] result.csv 无有效下载速度，跳过上传（避免覆盖线上历史结果）")
+		return
+	}
+	if err := utils.UploadToPages(pagesProject); err != nil {
+		utils.Red.Printf("[Pages] %v\n", err)
+	}
+}
+
+// 是否值得部署到 Pages：
+//   - 空结果        → 不上传
+//   - -dd 模式      → 上传（用户主动放弃下载测速，仅延迟数据也是有效的）
+//   - 否则          → 至少有一个 IP 速度 > 0 才上传
+func shouldUpload(data utils.DownloadSpeedSet) bool {
+	if len(data) == 0 {
+		return false
+	}
+	if task.Disable {
+		return true
+	}
+	for _, v := range data {
+		if v.DownloadSpeed > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // 根据情况选择退出方式（针对 Windows）

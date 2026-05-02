@@ -66,6 +66,13 @@ func TestDownloadSpeed(ipSet utils.PingDelaySet) (speedSet utils.DownloadSpeedSe
 	}
 
 	utils.Cyan.Printf("开始下载测速（下限：%.2f MB/s, 数量：%d, 队列：%d）\n", MinSpeed, TestCount, testNum)
+	// 增量写入：每测完一个 IP 就 flush 到 CSV，
+	// 即使中途 Ctrl+C 或崩溃，已测过的数据也保留在文件中。
+	incWriter, err := utils.NewIncrementalCsvWriter()
+	if err != nil {
+		utils.Yellow.Printf("[警告] 增量写入初始化失败：%v\n", err)
+	}
+	defer incWriter.Close()
 	// 控制 下载测速进度条 与 延迟测速进度条 长度一致（强迫症）
 	bar_a := len(strconv.Itoa(len(ipSet)))
 	bar_b := "     "
@@ -79,11 +86,14 @@ func TestDownloadSpeed(ipSet utils.PingDelaySet) (speedSet utils.DownloadSpeedSe
 		if ipSet[i].Colo == "" { // 只有当 Colo 是空的时候，才写入，否则代表之前是 httping 测速并获取过了
 			ipSet[i].Colo = colo
 		}
-		// 在每个 IP 下载测速后，以 [下载速度下限] 条件过滤结果
-		if speed >= MinSpeed*1024*1024 {
+		// 严格大于下限（MinSpeed=0 时也能排除 0 速度）：
+		// 增量写、speedSet、进度条 在同一守卫下统一触发，
+		// 不达标的 IP 不入 csv 也不计入 bar。
+		if speed > MinSpeed*1024*1024 {
+			incWriter.Write(ipSet[i])             // 立即落盘，避免中断丢失合格 IP
 			bar.Grow(1, "")
-			speedSet = append(speedSet, ipSet[i]) // 高于下载速度下限时，添加到新数组中
-			if len(speedSet) == TestCount {       // 凑够满足条件的 IP 时（下载测速数量 -dn），就跳出循环
+			speedSet = append(speedSet, ipSet[i]) // 高于下载速度下限时，添加到结果集
+			if len(speedSet) == TestCount {       // 凑够满足条件的 IP 时（-dn），跳出循环
 				break
 			}
 		}
