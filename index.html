@@ -45,14 +45,21 @@
   h1 { margin: 0; font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }
   .stamp { color: var(--muted); font-size: 0.875rem; font-variant-numeric: tabular-nums; }
   .actions { display: flex; gap: 0.625rem; font-size: 0.8125rem; }
-  .actions a {
+  .actions a, .actions button {
     color: var(--muted); text-decoration: none;
     padding: 0.375rem 0.75rem;
     border: 1px solid var(--border);
     border-radius: 6px;
+    background: var(--surface);
+    font: inherit; font-size: 0.8125rem;
+    cursor: pointer;
     transition: color 0.15s, border-color 0.15s;
+    font-variant-numeric: tabular-nums;
   }
-  .actions a:hover { color: var(--accent); border-color: var(--accent); }
+  .actions a:hover, .actions button:hover:not(:disabled) {
+    color: var(--accent); border-color: var(--accent);
+  }
+  .actions button:disabled { cursor: wait; opacity: 0.7; }
   .stats { display: flex; gap: 2.25rem; margin-bottom: 1.5rem; }
   .stat { display: flex; flex-direction: column; }
   .stat-num {
@@ -92,6 +99,28 @@
   td.num { text-align: right; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   td.ip { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 500; }
   td.speed { color: var(--accent); font-weight: 700; }
+  td.actions { padding: 0.375rem 0.75rem; }
+  .test-btn {
+    font: inherit; font-size: 0.8125rem;
+    padding: 0.25rem 0.625rem;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--surface);
+    color: var(--fg);
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+    font-variant-numeric: tabular-nums;
+    min-width: 4.5rem;
+  }
+  .test-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .test-btn:disabled { cursor: wait; opacity: 0.75; }
+  .test-btn.testing { color: var(--muted); }
+  .test-btn.ok { border-color: #16a34a; color: #16a34a; }
+  .test-btn.fail { border-color: #dc2626; color: #dc2626; }
+  @media (prefers-color-scheme: dark) {
+    .test-btn.ok { color: #22c55e; border-color: #22c55e; }
+    .test-btn.fail { color: #f87171; border-color: #f87171; }
+  }
   .toast {
     position: fixed; bottom: 2rem; left: 50%;
     transform: translateX(-50%) translateY(2rem);
@@ -123,6 +152,7 @@
     </div>
     <div class="actions">
       <a href="result.csv" download>下载 CSV</a>
+      <button id="test-all-btn" type="button">测试全部</button>
     </div>
   </header>
 
@@ -136,7 +166,7 @@
     <div class="empty">加载中...</div>
   </div>
 
-  <footer>点击行可复制 IP</footer>
+  <footer>点击行复制 IP · 顶部「测试全部」批量探测 · 单行「测试」按钮探测该 IP 握手延迟（约 ICMP ping 的 2~3 倍）</footer>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -146,6 +176,8 @@ const NUM_COLS = new Set([1, 2, 3, 4, 5, 6]);
 const SPEED_COL = 6;
 const DELAY_COL = 5;
 const TIME_COL = 8;
+
+const PROBE_TIMEOUT_MS = 5000;
 
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -158,6 +190,84 @@ function showToast(msg) {
   t.classList.add('show');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove('show'), 1400);
+}
+
+// 用 <img> 计时直接探测到指定 IP 的网络往返：
+//   连接路径 = TCP 握手 + TLS 握手 + 证书校验失败
+// 浏览器无法绕过证书校验，所以 onerror 会触发，但「触发前」的耗时
+// 就是真实经过该 IP 的握手 RTT（约 ICMP ping 的 2~3 倍）。
+function probeIP(ip, timeoutMs) {
+  return new Promise((resolve) => {
+    const url = ip.indexOf(':') >= 0
+      ? 'https://[' + ip + ']/cdn-cgi/trace?_=' + Date.now()  // IPv6 必须方括号
+      : 'https://' + ip + '/cdn-cgi/trace?_=' + Date.now();   // IPv4
+    const t0 = performance.now();
+    const img = new Image();
+    let done = false;
+    const finish = (status) => {
+      if (done) return;
+      done = true;
+      img.onload = img.onerror = null;
+      resolve({ ms: Math.round(performance.now() - t0), status });
+    };
+    const timer = setTimeout(() => { img.src = ''; finish('timeout'); }, timeoutMs);
+    img.onload = () => { clearTimeout(timer); finish('ok'); };
+    img.onerror = () => { clearTimeout(timer); finish('error'); };
+    img.src = url;
+  });
+}
+
+async function runTest(btn, ip) {
+  btn.disabled = true;
+  btn.textContent = '测试中…';
+  btn.className = 'test-btn testing';
+  const r = await probeIP(ip, PROBE_TIMEOUT_MS);
+  btn.disabled = false;
+  if (r.status === 'timeout') {
+    btn.textContent = '✗ 超时';
+    btn.className = 'test-btn fail';
+  } else {
+    // ok / error 都代表 IP 可达；error 仅表示证书或路径不匹配（绝大多数 CF IP 走这条）
+    btn.textContent = '~' + r.ms + ' ms';
+    btn.className = 'test-btn ok';
+  }
+}
+
+// 一键测速：6 路并发探测全部行，进度显示在顶部按钮上
+const TEST_ALL_CONCURRENCY = 6;
+let testAllRunning = false;
+async function runAllTests() {
+  if (testAllRunning) return;
+  const allBtn = document.getElementById('test-all-btn');
+  const trs = Array.from(document.querySelectorAll('tr.row'));
+  if (trs.length === 0) return;
+
+  testAllRunning = true;
+  allBtn.disabled = true;
+  let done = 0;
+  const total = trs.length;
+  const updateLabel = () => { allBtn.textContent = '测试中 ' + done + '/' + total; };
+  updateLabel();
+
+  let next = 0;
+  const worker = async () => {
+    while (next < trs.length) {
+      const tr = trs[next++];
+      const btn = tr.querySelector('button.test-btn');
+      const ip = tr.dataset.ip;
+      if (btn && !btn.disabled && ip) {
+        await runTest(btn, ip);
+      }
+      done++;
+      updateLabel();
+    }
+  };
+  await Promise.all(Array.from({ length: TEST_ALL_CONCURRENCY }, worker));
+
+  allBtn.disabled = false;
+  allBtn.textContent = '测试全部';
+  testAllRunning = false;
+  showToast('已测完 ' + total + ' 个 IP');
 }
 
 fetch('result.csv?_=' + Date.now(), { cache: 'no-store' })
@@ -198,7 +308,7 @@ fetch('result.csv?_=' + Date.now(), { cache: 'no-store' })
         const isSorted = i === sortIdx;
         const arrow = isSorted ? (sortDir === 1 ? ' ↑' : ' ↓') : '';
         return '<th data-i="' + i + '" class="' + (isSorted ? 'sorted' : '') + '">' + esc(h) + arrow + '</th>';
-      }).join('');
+      }).join('') + '<th>测试</th>';
       const trs = sorted.map((row) => {
         const tds = row.map((v, i) => {
           let cls = '';
@@ -206,7 +316,7 @@ fetch('result.csv?_=' + Date.now(), { cache: 'no-store' })
           else if (i === SPEED_COL) cls = 'num speed';
           else if (NUM_COLS.has(i)) cls = 'num';
           return '<td class="' + cls + '">' + esc(v) + '</td>';
-        }).join('');
+        }).join('') + '<td class="actions"><button class="test-btn">测试</button></td>';
         return '<tr class="row" data-ip="' + esc(row[0]) + '">' + tds + '</tr>';
       }).join('');
       host.innerHTML = '<table><thead><tr>' + ths + '</tr></thead><tbody>' + trs + '</tbody></table>';
@@ -226,8 +336,17 @@ fetch('result.csv?_=' + Date.now(), { cache: 'no-store' })
           }
         };
       });
+      host.querySelectorAll('tr.row').forEach((tr) => {
+        const btn = tr.querySelector('button.test-btn');
+        if (!btn) return;
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          runTest(btn, tr.dataset.ip);
+        });
+      });
     };
     render();
+    document.getElementById('test-all-btn').onclick = runAllTests;
   })
   .catch((err) => {
     document.getElementById('table-host').innerHTML = '<div class="empty">加载失败：' + esc(err.message) + '</div>';
